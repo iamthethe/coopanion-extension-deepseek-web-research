@@ -1,0 +1,27 @@
+/** 使用指定 Coopanion 的公开装载函数；只写包内 scratch，不启动实例。 */
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { resolve, join } from 'node:path';
+import { readFileSync, mkdirSync, mkdtempSync } from 'node:fs';
+import assert from 'node:assert/strict';
+const appDir = process.argv[2];
+if (!appDir) throw new Error('Usage: node --import tsx scripts/verify-local-host.mjs <Coopanion resources/app directory>');
+const packageDir = fileURLToPath(new URL('../', import.meta.url));
+const hostRoot = resolve(appDir, 'build/cortico');
+const hostImport = (path) => import(pathToFileURL(join(hostRoot, 'src', path)).href);
+await hostImport('extensions/runtime.ts');
+const { dryMountWorld } = await hostImport('extensions/dry-mount.ts');
+const { exportDescribe } = await hostImport('extensions/describe-export.ts');
+const { parseExtensionManifest, EXTENSION_API_VERSIONS } = await hostImport('extensions/manifest.ts');
+const manifest = parseExtensionManifest(JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8')), 'en');
+assert.equal(EXTENSION_API_VERSIONS.world, 6);
+assert.equal(manifest.ok, true);
+const { default: definition } = await import(new URL('../src/index.ts', import.meta.url));
+const scratchRoot = join(packageDir, 'scratch');
+mkdirSync(scratchRoot, { recursive: true });
+const options = { scratchDir: mkdtempSync(join(scratchRoot, 'local-host-')), packageDir, repoRoot: hostRoot, language: 'en' };
+const report = await dryMountWorld(definition, options);
+assert.deepEqual(report.failures, []);
+assert.deepEqual(report.warnings, []);
+assert.deepEqual(JSON.parse(readFileSync(join(packageDir, 'describe.json'), 'utf8')), await exportDescribe('world', definition, options));
+const version = JSON.parse(readFileSync(resolve(appDir, 'package.json'), 'utf8')).version;
+console.log(JSON.stringify({ host: `Coopanion ${version}`, api: EXTENSION_API_VERSIONS.world, report, describeMatches: true }, null, 2));
