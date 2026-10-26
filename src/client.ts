@@ -1,8 +1,11 @@
 /** 只把检索参数发到 DeepSeek 官方端点；错误回执不包含远端正文或鉴权头。 */
+import { setTimeout as delay } from 'node:timers/promises';
 export const API_BASE = 'https://api.deepseek.com/v1/tools';
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
-export class RequestError extends Error {}
+export class RequestError extends Error {
+  constructor(message: string, readonly retryable = false) { super(message); }
+}
 
 export function integer(value: unknown, name: string, min: number, max: number): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
@@ -39,6 +42,22 @@ const HTTP_HINTS: Record<number, string> = {
 
 export async function request(
   kind: 'search' | 'fetch', body: Record<string, unknown>, apiKey: string,
+  timeoutMs: number, signal: AbortSignal, retries = 0,
+): Promise<Record<string, unknown>> {
+  integer(retries, 'retries', 0, 5);
+  for (let attempt = 0; ; attempt++) {
+    try { return await requestOnce(kind, body, apiKey, timeoutMs, signal); }
+    catch (error) {
+      if (signal.aborted) throw new RequestError('请求已取消。');
+      if (!(error instanceof RequestError) || !error.retryable || attempt >= retries) throw error;
+      try { await delay(Math.min(1000 * 2 ** attempt, 8000), undefined, { signal }); }
+      catch { throw new RequestError('请求已取消。'); }
+    }
+  }
+}
+
+async function requestOnce(
+  kind: 'search' | 'fetch', body: Record<string, unknown>, apiKey: string,
   timeoutMs: number, signal: AbortSignal,
 ): Promise<Record<string, unknown>> {
   if (!apiKey.trim()) throw new RequestError('缺少 DeepSeek API Key，请在 World 配置中填写并保存。');
@@ -53,7 +72,8 @@ export async function request(
     });
     if (!response.ok) {
       await response.body?.cancel();
-      throw new RequestError(`DeepSeek HTTP ${response.status}：${HTTP_HINTS[response.status] ?? (response.status >= 500 ? '服务暂时不可用，可稍后重试。' : '请求失败。')}`);
+      throw new RequestError(`DeepSeek HTTP ${response.status}：${HTTP_HINTS[response.status] ?? (response.status >= 500 ? '服务暂时不可用，可稍后重试。' : '请求失败。')}`,
+        response.status === 408 || response.status === 429 || response.status >= 500);
     }
     if (!response.body) throw new RequestError('DeepSeek 返回空响应。');
     const reader = response.body.getReader();
@@ -71,14 +91,16 @@ export async function request(
       await reader.cancel().catch(() => {});
       reader.releaseLock();
     }
-    const data: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error();
+    let data: unknown;
+    try { data = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+    catch { throw new RequestError('DeepSeek 返回了无效 JSON。'); }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new RequestError('DeepSeek 返回的数据结构不合法。');
     return data as Record<string, unknown>;
   } catch (error) {
     if (signal.aborted) throw new RequestError('请求已取消。');
-    if (timeout.aborted) throw new RequestError('DeepSeek 请求超时，请稍后重试。');
+    if (timeout.aborted) throw new RequestError('DeepSeek 请求超时，请稍后重试。', true);
     if (error instanceof RequestError) throw error;
-    throw new RequestError('DeepSeek 网络请求失败或返回了无效 JSON，请检查网络后重试。');
+    throw new RequestError('DeepSeek 网络请求失败，请检查网络后重试。', true);
   }
 }
 

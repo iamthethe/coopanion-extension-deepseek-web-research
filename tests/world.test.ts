@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdirSync, mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import type { ToolCallContext, ToolOutcome } from 'cortico/core/types.ts';
 import { dryMountWorld, fakeWorldContext } from 'cortico/extensions/dry-mount.ts';
@@ -13,8 +13,10 @@ const scratchRoot = resolve('scratch');
 mkdirSync(scratchRoot, { recursive: true });
 const call = {} as ToolCallContext;
 function makeWorld(key = 'test-token') {
-  const cfg = { ...DEEPSEEKSEARCH_DEFAULTS, apiKey: key };
-  const world = new DeepseeksearchWorld({ cfg, timezone: 'Asia/Shanghai' });
+  const cfg = { ...DEEPSEEKSEARCH_DEFAULTS };
+  let savedKey = key;
+  const world = new DeepseeksearchWorld({ cfg, timezone: 'Asia/Shanghai', secret: () => savedKey,
+    saveKey: (value) => { savedKey = value; cfg.apiKey = ''; } });
   const run = (name: 'search' | 'fetch', args: Record<string, unknown>, ctx = call) =>
     world.tools().find((tool) => tool.name === `deepseeksearch_${name}`)!.handler(args, ctx) as Promise<ToolOutcome>;
   return { cfg, world, run };
@@ -31,7 +33,7 @@ afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
 describe('DeepSeek World', () => {
   it('默认配置无密钥可干装载，提示词文件可找到', async () => {
     const report = await dryMountWorld(DEEPSEEKSEARCH, {
-      scratchDir: mkdtempSync(join(scratchRoot, 'mount-')), packageDir: resolve('.'),
+      scratchDir: mkdtempSync(join(scratchRoot, 'mount-')), packageDir: resolve('.'), hasWebUiClient: true,
     });
     expect(report.failures).toEqual([]);
     expect(report.warnings).toEqual([]);
@@ -56,25 +58,27 @@ describe('DeepSeek World', () => {
   });
   it('配置密钥保存后搜索与抓取均使用新密钥，状态与回执不回显密钥', async () => {
     const transport = reply({ results: [], title: 'Page', content: 'Body' });
-    const { cfg, world, run } = makeWorld();
+    const { world, run } = makeWorld();
     await run('search', { query: 'q' });
-    cfg.apiKey = 'updated-test-token';
+    await world.webUi().invoke!('credentials', 'saveKey', ['updated-test-token']);
     const result = await run('fetch', { url: 'https://example.com' });
     expect(new Headers(transport.mock.calls[0][1]!.headers).get('Authorization')).toBe('Bearer test-token');
-    expect(new Headers(transport.mock.calls[1][1]!.headers).get('Authorization')).toBe(`Bearer ${cfg.apiKey}`);
-    expect(JSON.stringify(world.webUi())).not.toContain(cfg.apiKey);
-    expect(result.text).not.toContain(cfg.apiKey);
+    expect(new Headers(transport.mock.calls[1][1]!.headers).get('Authorization')).toBe('Bearer updated-test-token');
+    expect(JSON.stringify(world.webUi())).not.toContain('updated-test-token');
+    expect(result.text).not.toContain('updated-test-token');
   });
-  it('旧配置缺少apiKey时不回落到宿主secret', async () => {
+  it('旧明文配置未迁移时不用于请求，状态不回显旧密钥', async () => {
     const transport = reply({ results: [] });
     const ctx = fakeWorldContext(DEEPSEEKSEARCH, { scratchDir: mkdtempSync(join(scratchRoot, 'legacy-')) });
-    delete ctx.cfg.apiKey;
-    ctx.secret = () => { throw new Error('不得读取环境密钥'); };
+    ctx.cfg.apiKey = 'legacy-fixture-token';
+    ctx.secret = () => '';
     const world = DEEPSEEKSEARCH.create(ctx);
     const result = await world.tools()[0].handler({ query: 'q' }, call) as ToolOutcome;
     expect(result.failed).toBe(true);
     expect(result.text).toContain('World 配置');
     expect(transport).not.toHaveBeenCalled();
+    const state = await world.webUi!().invoke!('credentials', 'state', []);
+    expect(state).toEqual({ maskedKey: null, legacyKeyPresent: true });
   });
   it('搜索序列化参数并保留证据与来源，配置修改下次请求生效', async () => {
     const transport = reply({ results: [item] });
@@ -94,6 +98,109 @@ describe('DeepSeek World', () => {
     const result = await makeWorld().run('search', { query: 'no matches' });
     expect(result.failed).toBeUndefined();
     expect(JSON.parse(result.text).data.results).toEqual([]);
+  });
+  it('默认和显式搜索条数都受部署上限约束并报告裁剪', async () => {
+    const transport = reply({ results: Array.from({ length: 6 }, () => item) });
+    const { cfg, run } = makeWorld();
+    cfg.count = 5; cfg.maxCount = 2;
+    for (const args of [{ query: 'q' }, { query: 'q', count: 4 }]) {
+      const data = JSON.parse((await run('search', args)).text).data;
+      expect(data.results).toHaveLength(2);
+      expect(data.countCapped).toBe(true);
+      expect(data.effectiveCount).toBe(2);
+    }
+    expect(transport.mock.calls.map(([, options]) => JSON.parse(options!.body as string).count)).toEqual([2, 2]);
+  });
+  it('保留当前完整返回默认；简短和摘要模式仅返回所选信息', async () => {
+    reply({ results: [item] });
+    const { cfg, run } = makeWorld();
+    const full = JSON.parse((await run('search', { query: 'q' })).text).data.results[0];
+    expect(full).toMatchObject({ snippet: item.snippet, summary: item.summary, rerank_score: item.rerank_score });
+    cfg.resultDetail = 'brief';
+    const brief = JSON.parse((await run('search', { query: 'q' })).text).data.results[0];
+    expect(brief.snippet).toBe(item.snippet); expect(brief.summary).toBeUndefined(); expect(brief.authority).toBeUndefined();
+    cfg.resultDetail = 'summary';
+    const summary = JSON.parse((await run('search', { query: 'q' })).text).data.results[0];
+    expect(summary.summary).toBe(item.summary); expect(summary.snippet).toBeUndefined();
+  });
+  it('摘要按Unicode限制且明确标记，0保留原文', async () => {
+    reply({ results: [{ ...item, snippet: '😀'.repeat(5), summary: '正文'.repeat(5) }] });
+    const { cfg, run } = makeWorld(); cfg.maxTextChars = 3;
+    const cropped = JSON.parse((await run('search', { query: 'q' })).text).data.results[0];
+    expect(cropped.snippet).toBe('😀😀😀'); expect(cropped.summary).toBe('正文正');
+    expect(cropped.snippetTruncated).toBe(true); expect(cropped.summaryTruncated).toBe(true);
+    cfg.maxTextChars = 0;
+    expect(JSON.parse((await run('search', { query: 'q' })).text).data.results[0].summary).toBe('正文'.repeat(5));
+  });
+  it('默认正文开关可热改，显式参数可覆盖', async () => {
+    const transport = reply({ results: [item] });
+    const { cfg, run } = makeWorld(); cfg.includeContent = true;
+    expect(JSON.parse((await run('search', { query: 'q' })).text).data.results[0].content).toBe(item.content);
+    expect(JSON.parse((await run('search', { query: 'q', need_content: false })).text).data.results[0].content).toBe('');
+    expect(transport.mock.calls.map(([, options]) => JSON.parse(options!.body as string).need_content)).toEqual([true, false]);
+  });
+  it('密钥保存只返回打码状态，拒绝占位符和未知面板', async () => {
+    const { world } = makeWorld();
+    const invoke = world.webUi().invoke!;
+    expect(await invoke('credentials', 'state', [])).toEqual({ maskedKey: '••••••••', legacyKeyPresent: false });
+    for (const key of ['', 'has space', '••••••••']) await expect(invoke('credentials', 'saveKey', [key])).rejects.toThrow();
+    await expect(invoke('other', 'saveKey', ['fixture-token'])).rejects.toThrow();
+    const group = world.webUi().config![0];
+    expect(group.schema.properties).not.toHaveProperty('worlds.deepseeksearch.apiKey');
+  });
+  it('用户迁移时先备份.env和旧配置，再写密钥并清空旧字段', async () => {
+    const ctx = fakeWorldContext(DEEPSEEKSEARCH, { scratchDir: mkdtempSync(join(scratchRoot, 'migration-')) });
+    ctx.cfg.apiKey = 'legacy-fixture-token';
+    const envPath = join(ctx.botDir, '.env'), configPath = join(ctx.botDir, 'config.json');
+    writeFileSync(envPath, 'OTHER_KEY=other-fixture\n');
+    writeFileSync(configPath, JSON.stringify({ worlds: { deepseeksearch: ctx.cfg } }));
+    let saved = '';
+    ctx.secret = () => saved;
+    ctx.storeSecret = (_name, value) => { saved = value; writeFileSync(envPath, `OTHER_KEY=other-fixture\nCORTICO_DEEPSEEK_API_KEY=${value}\n`); };
+    const world = DEEPSEEKSEARCH.create(ctx);
+    const result = await world.webUi!().invoke!('credentials', 'migrateKey', []);
+    expect(result).toEqual({ maskedKey: '••••••••', legacyKeyPresent: false });
+    expect(saved).toBe('legacy-fixture-token'); expect(ctx.cfg.apiKey).toBe('');
+    const backups = readdirSync(ctx.botDir).filter((name) => name.endsWith('.bak'));
+    expect(backups).toHaveLength(2);
+    expect(readFileSync(join(ctx.botDir, backups.find((name) => name.startsWith('.env.'))!), 'utf8')).toBe('OTHER_KEY=other-fixture\n');
+    expect(readFileSync(join(ctx.botDir, backups.find((name) => name.startsWith('config.json.'))!), 'utf8')).toContain('legacy-fixture-token');
+  });
+  it('密钥写入失败保留旧配置，不回显含密钥的底层错误', async () => {
+    const ctx = fakeWorldContext(DEEPSEEKSEARCH, { scratchDir: mkdtempSync(join(scratchRoot, 'failed-migration-')) });
+    ctx.cfg.apiKey = 'legacy-fixture-token';
+    ctx.storeSecret = () => { throw new Error('echo legacy-fixture-token'); };
+    const world = DEEPSEEKSEARCH.create(ctx);
+    await expect(world.webUi!().invoke!('credentials', 'migrateKey', [])).rejects.toThrow('保存或旧配置清理失败');
+    expect(ctx.cfg.apiKey).toBe('legacy-fixture-token');
+  });
+  it('瞬时故障按重试次数恢复，不重试401、402或无效JSON', async () => {
+    vi.useFakeTimers();
+    const transport = reply({ results: [] });
+    transport.mockImplementationOnce(async () => new Response('{}', { status: 503 }));
+    const { cfg, run } = makeWorld(); cfg.retries = 2;
+    const pending = run('search', { query: 'q' });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect((await pending).failed).toBeUndefined(); expect(transport).toHaveBeenCalledTimes(2);
+    for (const status of [401, 402]) {
+      transport.mockClear(); transport.mockImplementation(async () => new Response('{}', { status }));
+      expect((await run('search', { query: 'q' })).failed).toBe(true); expect(transport).toHaveBeenCalledTimes(1);
+    }
+    transport.mockClear(); transport.mockImplementation(async () => new Response('bad-json'));
+    expect((await run('search', { query: 'q' })).failed).toBe(true); expect(transport).toHaveBeenCalledTimes(1);
+  });
+  it('持续429总尝试次数为1加重试次数；等待期间可取消', async () => {
+    vi.useFakeTimers();
+    const transport = reply({}, 429);
+    const { cfg, run } = makeWorld(); cfg.retries = 2;
+    const pending = run('search', { query: 'q' });
+    await vi.advanceTimersByTimeAsync(3100);
+    expect((await pending).failed).toBe(true); expect(transport).toHaveBeenCalledTimes(3);
+    transport.mockClear();
+    const controller = new AbortController();
+    const cancelled = run('search', { query: 'q' }, { signal: controller.signal } as ToolCallContext);
+    await vi.advanceTimersByTimeAsync(0); controller.abort();
+    expect((await cancelled).text).toContain('取消'); expect(transport).toHaveBeenCalledTimes(1);
   });
   it('接受128个Unicode字符，拒绝超长、空查询及非法计数', async () => {
     const transport = reply({ results: [] });

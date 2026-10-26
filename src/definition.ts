@@ -1,5 +1,8 @@
 import { describeTools, type WorldDefinition } from 'cortico/world.ts';
-import { DEEPSEEKSEARCH_DEFAULTS, type DeepseeksearchConfigSection } from './config.ts';
+import { copyFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { DEEPSEEKSEARCH_DEFAULTS, DEEPSEEKSEARCH_SECRET, type DeepseeksearchConfigSection } from './config.ts';
 import { DEEPSEEKSEARCH_TOOL_DECLS, DeepseeksearchWorld } from './world.ts';
 
 export const DEEPSEEKSEARCH: WorldDefinition<DeepseeksearchConfigSection> = {
@@ -8,6 +11,17 @@ export const DEEPSEEKSEARCH: WorldDefinition<DeepseeksearchConfigSection> = {
   defaults: () => ({ ...DEEPSEEKSEARCH_DEFAULTS }),
   create: (ctx) => new DeepseeksearchWorld({
     cfg: ctx.cfg, timezone: ctx.timezone,
+    secret: () => ctx.secret(DEEPSEEKSEARCH_SECRET),
+    saveKey: (value) => {
+      const suffix = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}.bak`;
+      // 用户主动保存时备份现有凭证；旧配置清理必须在 .env 写入成功之后。
+      for (const name of ['.env', ...(ctx.cfg.apiKey ? ['config.json'] : [])]) {
+        const file = join(ctx.botDir, name);
+        if (existsSync(file)) copyFileSync(file, `${file}.${suffix}`, 1);
+      }
+      ctx.storeSecret(DEEPSEEKSEARCH_SECRET, value);
+      if (ctx.cfg.apiKey) ctx.persist({ apiKey: '' });
+    },
   }),
   describe: {
     tools: describeTools(DEEPSEEKSEARCH_TOOL_DECLS, {
