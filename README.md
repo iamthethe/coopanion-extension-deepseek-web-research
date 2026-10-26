@@ -9,7 +9,7 @@ Owner: `src/definition.ts`, `src/world.ts`, `src/client.ts`
 
 1. 在 Coopanion 的 WebUI 打开「扩展」→ World →「手动安装」→「从本机目录安装」，选择：
 
-   `D:\AI\coopanion-voice-ex\state\packages\cortico-world-deepseeksearch`
+   `cortico-world-deepseeksearch`
 
 2. 完全退出并重新启动 Coopanion。在「World」→「DeepSeek 网页搜索」的配置中填写「DeepSeek API Key」并保存。
    密钥明文保存在部署 `config.json` 的 `worlds.deepseeksearch.apiKey`，保存后下次请求生效。
@@ -57,30 +57,3 @@ Owner: `src/definition.ts`, `src/world.ts`, `src/client.ts`
 [Fetch Schema](https://api-docs.deepseek.com/zh-cn/api/fetch/)。
 Search / Fetch 按成功且有结果的请求计费，当前各5元/1000次；实际以DeepSeek官方说明为准。
 
-## 开发验证
-
-```powershell
-cd D:\AI\coopanion-voice-ex\state\packages\cortico-world-deepseeksearch
-pnpm install
-pnpm typecheck
-pnpm test --maxWorkers 1 --minWorkers 1
-node --import tsx scripts/verify-local-host.mjs D:\AI\coopanion\resources\app
-```
-
-可选独立在线诊断：在 World 配置保存密钥后，显式指定当前部署的 `config.json`。以下路径需按实际部署核对：
-
-```powershell
-node --import tsx scripts/smoke.mjs search "DeepSeek Search API site:api-docs.deepseek.com" "D:\AI\coopanion\data\home\companion\config.json"
-node --import tsx scripts/smoke.mjs fetch "https://api-docs.deepseek.com/zh-cn/guides/search/" "D:\AI\coopanion\data\home\companion\config.json"
-```
-
-该脚本只读指定配置，不读取.env；每条命令可能计费，结果显示在命令行。未配置密钥时返回失败，不访问网络。
-
-在完整 Cortico checkout 中重新导出与校验：
-
-```powershell
-pnpm describe:extension D:\AI\coopanion-voice-ex\state\packages\cortico-world-deepseeksearch
-pnpm check:extension D:\AI\coopanion-voice-ex\state\packages\cortico-world-deepseeksearch
-```
-
-当前检查结果详见 `VALIDATION.md`。本机宿主干装载检查不能代替完整官方checker或真实联网验收。
